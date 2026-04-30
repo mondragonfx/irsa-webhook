@@ -63,7 +63,7 @@ spec:
       serviceAccountName: irsa-webhook
       containers:
       - name: webhook
-        image: vultr/irsa-webhook:v0.1.0
+        image: vultr/irsa-webhook:v0.2.0
         imagePullPolicy: Always
         ports:
         - containerPort: 8443
