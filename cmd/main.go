@@ -77,6 +77,7 @@ func main() {
 	// TLS configuration
 	tlsCertPath := getEnv("TLS_CERT_PATH", "/etc/webhook/certs/tls.crt")
 	tlsKeyPath := getEnv("TLS_KEY_PATH", "/etc/webhook/certs/tls.key")
+	bindAddr := getEnv("BIND_ADDR", "0.0.0.0")
 	port := getEnv("PORT", "8443")
 
 	cert, err := tls.LoadX509KeyPair(tlsCertPath, tlsKeyPath)
@@ -90,7 +91,7 @@ func main() {
 	}
 
 	httpServer := &http.Server{
-		Addr:      fmt.Sprintf(":%s", port),
+		Addr:      fmt.Sprintf("%s:%s", bindAddr, port),
 		TLSConfig: tlsConfig,
 		Handler:   mux,
 	}
