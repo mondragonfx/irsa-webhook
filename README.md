@@ -1,78 +1,117 @@
-# IRSA Mutating Admission Webhook for Kubernetes
+# IRSA for Vultr Kubernetes
 
-This webhook implements IAM Roles for Service Accounts (IRSA) for Kubernetes clusters, allowing pods to assume Vultr IAM roles using projected service account tokens.
+IAM Roles for Service Accounts (IRSA) lets a pod assume a Vultr IAM role using
+its projected ServiceAccount token, with no static API keys in the cluster.
+Annotate a ServiceAccount with a Vultr role ID and every pod that uses it
+receives a short-lived token, signed by the cluster and trusted by Vultr IAM,
+that the application exchanges for a Vultr API session.
+
+The consumer is any application that calls the Vultr API: the cluster
+autoscaler, the cloud controller manager, or your own code using govultr.
+
+This repository ships two ways to perform that injection:
+
+| Mode | Kubernetes | What runs in your cluster | TLS certificates |
+|---|---|---|---|
+| **MutatingAdmissionPolicy** (recommended) | 1.36+ (1.34/1.35 with the feature gate) | Nothing. Two cluster-scoped policy objects evaluated inside the API server. | None |
+| **Webhook** | 1.20+ | A two-replica Deployment, Service and MutatingWebhookConfiguration | Required, see below |
+
+Both modes produce identical pods.
 
 ## Features
 
-- Automatically injects Vultr credentials configuration into pods
-- Compatibility with AWS SDK
-- Uses projected service account tokens with custom audience
-- Supports multiple containers and init containers
-- Follows security best practices
-- No external dependencies beyond Kubernetes API
+- Gives pods a projected ServiceAccount token, with a dedicated audience, that
+  Vultr IAM accepts in exchange for a role session
+- Injects `VULTR_ROLE_ID` and the token path so applications know what to
+  exchange; no static API keys anywhere in the cluster
+- Handles containers and init containers
+- Idempotent: safe under webhook reinvocation and alongside sidecar injectors
+- Opt-out per namespace with a single label
+- No dependencies beyond the Kubernetes API
 
 ## How It Works
 
-When a pod is created, the webhook:
+When a pod is created, the policy or webhook:
 
-1. Extracts the ServiceAccount name from the pod spec
-2. Fetches the ServiceAccount from the Kubernetes API
-3. Checks for the `api.vultr.com/role` annotation
-4. If present, mutates the pod to inject:
-   - **Environment Variables:**
-     - `AWS_ROLE_ARN`: The IAM role ARN from the annotation
-     - `AWS_WEB_IDENTITY_TOKEN_FILE`: Path to the projected token
-     - `AWS_STS_REGIONAL_ENDPOINTS`: Set to "regional"
-   - **Volume:** A projected ServiceAccount token volume with audience "vultr"
-   - **Volume Mounts:** Mounts the token at `/var/run/secrets/vultr.com/serviceaccount`
+1. Looks up the pod's ServiceAccount (`default` when none is set)
+2. Checks for the `api.vultr.com/role` annotation
+3. If present, mutates the pod to add:
+   - **Volume:** a projected ServiceAccount token with audience `vultr`
+   - **Volume mounts:** the token at `/var/run/secrets/vultr.com/serviceaccount/token`
+   - **Environment variables** on every container and init container:
+     - `VULTR_ROLE_ID`: the value of the annotation
+     - `VULTR_WEB_IDENTITY_TOKEN_FILE`: path to the projected token
+     - `AWS_ROLE_ARN`, `AWS_WEB_IDENTITY_TOKEN_FILE`, `AWS_STS_REGIONAL_ENDPOINTS`,
+       `AWS_ENDPOINT_URL_STS`: kept for consumers written against the
+       STS-compatible endpoint; `AWS_ROLE_ARN` carries the same role ID
+
+The application then exchanges the token for a Vultr API session; see
+[Using the role from your application](#using-the-role-from-your-application).
+
+Pods in `kube-system`, `kube-node-lease`, `kube-public` and the webhook's own
+namespace are never mutated. Label any other namespace `irsa-webhook=disabled`
+to exclude it.
 
 ## Prerequisites
 
-- Kubernetes 1.20+ (for projected service account tokens)
+- A Vultr IAM role and an OIDC issuer registered for your cluster (see
+  [Registering your cluster](#registering-your-cluster))
 - `kubectl` configured to access your cluster
-  - Deploy a VKE cluster and do `export KUBECONFIG=~/Downloads/vke-64c243de-eb0b-4084-93ae-6c386bef8978.yaml`
-- OpenSSL (for certificate generation)
-- Go 1.24+ (for building from source)
+- For the webhook mode only: OpenSSL for certificate generation
 
-## Quick Start
+## Install: MutatingAdmissionPolicy (recommended)
 
-### 1. Build the Docker Image
+```bash
+kubectl apply -f deploy/mutating-admission-policy.yaml
+```
+
+That is the whole install. The policy runs inside the API server, so there is
+no image to pull, no Deployment to run, and no certificate to manage.
+
+On Kubernetes 1.34 or 1.35 the feature is beta and off by default. Start the
+API server with `--feature-gates=MutatingAdmissionPolicy=true` and
+`--runtime-config=admissionregistration.k8s.io/v1beta1=true`, and change the
+`apiVersion` in the manifest to `admissionregistration.k8s.io/v1beta1`.
+
+## Install: Webhook (Kubernetes older than 1.36)
+
+### 1. Build the image (optional)
+
+Release images are published as `vultr/irsa-webhook:<tag>`. To build your own:
 
 ```bash
 docker build -t your-registry/irsa-webhook:latest .
 docker push your-registry/irsa-webhook:latest
 ```
 
-Update `deploy.yaml` with your image location.
+Update the image in `deploy/webhook.yaml`, or run
+`make set-manifest-image WEBHOOK_IMAGE=your-registry/irsa-webhook:latest`.
 
-### 2. Generate TLS Certificates
+### 2. Generate TLS certificates
 
-The webhook requires TLS certificates to communicate with the Kubernetes API server:
+The API server calls the webhook over TLS, so it needs a serving certificate
+and the CA that signed it:
 
 ```bash
-chmod +x generate-certs.sh
 ./generate-certs.sh
 ```
 
-This script will:
-- Generate a self-signed CA and certificate
-- Create a Kubernetes secret with the certificates
-- Update the MutatingWebhookConfiguration with the CA bundle
+This creates a self-signed CA and certificate, stores them in the
+`irsa-webhook-certs` Secret, and records the CA bundle for the next step.
+Automatic certificate bootstrapping and rotation inside the webhook is
+planned; until then rerun this script to rotate.
 
-### 3. Deploy the Webhook
+### 3. Deploy
 
 ```bash
-kubectl apply -f deploy.yaml
+make deploy
 ```
 
-This creates:
-- Namespace: `irsa-system`
-- ServiceAccount with RBAC permissions
-- Deployment with 2 replicas
-- Service
-- MutatingWebhookConfiguration
+This substitutes the CA bundle into `deploy/webhook.yaml` and applies it,
+creating the `irsa-system` namespace, RBAC, a two-replica Deployment with a
+PodDisruptionBudget, a Service, and the MutatingWebhookConfiguration.
 
-### 4. Verify Deployment
+### 4. Verify
 
 ```bash
 kubectl get pods -n irsa-system
@@ -81,9 +120,10 @@ kubectl logs -n irsa-system -l app=irsa-webhook
 
 ## Usage
 
-### Annotate ServiceAccount
+### Annotate a ServiceAccount
 
-To enable IRSA for a ServiceAccount, add the `api.vultr.com/role` annotation:
+Set the `api.vultr.com/role` annotation to the ID of the Vultr IAM role the
+pods should assume:
 
 ```yaml
 apiVersion: v1
@@ -95,9 +135,12 @@ metadata:
     api.vultr.com/role: "775a6be6-45cd-4f19-94f5-6e4f96f093ec"
 ```
 
-### Deploy a Pod
+The annotation is read when a pod is **created**. Pods that already exist
+when the annotation is added must be recreated.
 
-Any pod using this ServiceAccount will automatically receive the AWS configuration:
+### Deploy a pod
+
+Any pod using that ServiceAccount receives the configuration automatically:
 
 ```yaml
 apiVersion: v1
@@ -109,157 +152,103 @@ spec:
   serviceAccountName: my-app
   containers:
   - name: app
-    image: amazon/aws-cli:latest
+    image: curlimages/curl:latest
     command: ["sleep", "3600"]
 ```
 
-### Verify Injection
-
-Check that the pod has the injected configuration:
+### Verify injection
 
 ```bash
-# Check environment variables
-kubectl exec my-app -- env | grep AWS
-
-# Check volume mount
+kubectl exec my-app -- env | grep VULTR_
 kubectl exec my-app -- ls -la /var/run/secrets/vultr.com/serviceaccount
-
-# Test AWS credentials
-kubectl exec my-app -- aws sts get-caller-identity
 ```
+
+Then exchange the token as shown in the next section; a `201` with a
+`session_token` means the cluster's issuer is registered and the role trusts it.
+
+## Using the role from your application
+
+The projected token is a JWT with audience `vultr`. Exchange it at the
+native assume-role endpoint and use the returned `session_token` as a Vultr
+API bearer token for the lifetime of the session:
+
+```bash
+TOKEN=$(cat "$VULTR_WEB_IDENTITY_TOKEN_FILE")
+curl -s -X POST https://api.vultr.com/v2/assumed-roles/assume \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"role_id\": \"$VULTR_ROLE_ID\", \"session_name\": \"$HOSTNAME\", \"auth_method\": \"oidc\", \"duration\": 3600}"
+# -> {"session_token": "...", "expires_at": "2026-09-18 15:42:19", ...}
+```
+
+The session is scoped to the role's policies and expires after `duration`
+seconds (at most the role's `max_session_duration`). Re-read the token file
+and repeat the exchange before `expires_at`; the kubelet rotates the
+projected token automatically, so never cache it beyond a single exchange.
+
+In Go, wrap that in an `oauth2.TokenSource` and hand it to govultr. The
+cluster-autoscaler Vultr provider is the reference implementation of this
+pattern: it refreshes the session five minutes before expiry and falls back
+to a static token when `VULTR_ROLE_ID` is unset.
+
+Trust is granted on the Vultr side with a role trust of type
+`TemporaryAssumption` for your cluster's OIDC issuer. Note that role trusts
+currently support IP, time-of-day and expiry conditions only; a trust to an
+issuer applies to every ServiceAccount in that cluster.
 
 ## Configuration
 
-### Environment Variables
+### Webhook environment variables
 
-The webhook supports the following environment variables:
 
-- `TLS_CERT_PATH`: Path to TLS certificate (default: `/etc/webhook/certs/tls.crt`)
-- `TLS_KEY_PATH`: Path to TLS private key (default: `/etc/webhook/certs/tls.key`)
-- `PORT`: HTTPS port to listen on (default: `8443`)
+### Failure policy
 
-### Webhook Configuration
-
-Edit the `MutatingWebhookConfiguration` in `deploy.yaml`:
-
-- **failurePolicy**: Set to `Fail` for production to block pods if webhook is unavailable
-- **timeoutSeconds**: Adjust timeout based on cluster performance
-- **namespaceSelector**: Control which namespaces are affected
+Both manifests fail closed (`failurePolicy: Fail`). A pod whose ServiceAccount
+asked for credentials is rejected, with a clear error, rather than silently
+started without them. System namespaces and the webhook's own namespace are
+excluded so a broken webhook can always be repaired. Set
+`failurePolicy: Ignore` in `deploy/webhook.yaml` only if you would rather
+have pods start without credentials during a webhook outage.
 
 ## Security Considerations
 
-1. **Least Privilege**: The webhook ServiceAccount only has permissions to read ServiceAccounts
-2. **TLS**: All communication is encrypted using TLS 1.2+
-3. **Non-root**: Container runs as non-root user (65532)
-4. **Read-only filesystem**: Container has read-only root filesystem
-5. **No privilege escalation**: Security context prevents privilege escalation
+1. **Least privilege**: the webhook ServiceAccount can only read ServiceAccounts
+2. **TLS**: the webhook serves TLS 1.2 or newer; the policy mode has no network path at all
+3. **Non-root**: the container runs as user 65532 with a read-only root filesystem and no capabilities
+4. **Idempotent mutation**: rerunning the injection never duplicates volumes or variables
 
 ## Troubleshooting
 
-### Webhook Not Mutating Pods
-
-1. Check webhook logs:
-   ```bash
-   kubectl logs -n irsa-system -l app=irsa-webhook
-   ```
-
-2. Verify MutatingWebhookConfiguration:
-   ```bash
-   kubectl get mutatingwebhookconfiguration irsa-webhook -o yaml
-   ```
-
-3. Check if ServiceAccount has the annotation:
-   ```bash
-   kubectl get sa <service-account-name> -o yaml
-   ```
-
-### Certificate Issues
-
-If you see TLS errors, regenerate certificates:
+See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md). The short version:
 
 ```bash
-./generate-certs.sh
-kubectl rollout restart deployment -n irsa-system irsa-webhook
-```
+# Is the ServiceAccount annotated?
+kubectl get sa <name> -o jsonpath='{.metadata.annotations.api\.vultr\.com/role}'
 
-### RBAC Permissions
+# Policy mode: is the policy bound and free of errors?
+kubectl get mutatingadmissionpolicy irsa.vultr.com -o yaml
 
-If webhook can't fetch ServiceAccounts, verify RBAC:
-
-```bash
-kubectl auth can-i get serviceaccounts --as=system:serviceaccount:irsa-system:irsa-webhook --all-namespaces
+# Webhook mode: is it healthy?
+kubectl get mutatingwebhookconfiguration irsa-webhook -o yaml
+kubectl logs -n irsa-system -l app=irsa-webhook
 ```
 
 ## Development
 
-### Local Testing
-
-You can test the webhook logic locally:
-
-```go
-package main
-
-import (
-    "testing"
-    corev1 "k8s.io/api/core/v1"
-)
-
-func TestGeneratePatches(t *testing.T) {
-    ws := &WebhookServer{}
-    pod := &corev1.Pod{
-        Spec: corev1.PodSpec{
-            Containers: []corev1.Container{
-                {Name: "test"},
-            },
-        },
-    }
-
-    patches, err := ws.generatePatches(pod, "arn:aws:iam::123456789012:role/test")
-    if err != nil {
-        t.Fatalf("Failed to generate patches: %v", err)
-    }
-
-    if len(patches) == 0 {
-        t.Error("Expected patches to be generated")
-    }
-}
-```
-
-### Building from Source
-
 ```bash
-go mod download
-go build -o webhook main.go
+go test ./...
+go build -o webhook ./cmd/
 ```
 
-## Architecture
+The injection logic lives in `internal/mutate` and is covered by unit tests,
+including idempotency and reinvocation cases. The admission handler lives in
+`internal/server` and is tested against a fake Kubernetes client.
 
-```
-┌─────────────┐
-│ Kubernetes  │
-│ API Server  │
-└──────┬──────┘
-       │
-       │ AdmissionReview Request
-       │
-       ▼
-┌─────────────────┐
-│ IRSA Webhook    │
-│                 │
-│ 1. Parse Pod    │
-│ 2. Get SA       │◄────┐
-│ 3. Check Anno   │     │
-│ 4. Gen Patches  │     │
-└─────────────────┘     │
-                        │
-                  ┌─────┴──────┐
-                  │ K8s API    │
-                  │ (Get SA)   │
-                  └────────────┘
-```
+## Registering your cluster
 
-## Complete Flow
-- Register your cluster's JWKS as an OIDC Issuer at `https://api.vultr.com/v2/oidc/issuer`
+Before pods can assume roles, Vultr must trust your cluster's ServiceAccount
+token signer. Register an OIDC issuer at `https://api.vultr.com/v2/oidc/issuer`:
+
   - For VKE clusters:
   ```
   {
@@ -280,90 +269,8 @@ go build -o webhook main.go
     "use": "sig"
   }
   ```
-- From this point you will be able to auth to the vultr API from inside your kubernetes cluster using the standard - See the file in this repo `test-oidc-issuer.yaml`
-- Deploy this irsa-webhook to your cluster
-- Pod->STS
-  - Now when when a pod is owned by a serviceAccount with the annotation `api.vultr.com/role`, the pod will send a token issued by the cluster to the Vultr sts endpoint.
-- STS->Pod
-  - Vultr's STS endpoint will respond with tokens issued by Vultr that are injected into the pod for the application running in the pod to consume
-
-
-## The Full Flow with Both Tokens
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ YOUR CLUSTER                                                                 │
-│                                                                              │
-│ Kubernetes API Server (configured with your issuer)                          │
-│ ├─ Generates TOKEN #1 (ServiceAccount JWT)                                   │
-│ │  Signed with: cluster's private key                                        │
-│ │  Claims:                                                                   │
-│ │    iss: "https://api.vultr.com/v2/oidc"                                    │
-│ │    aud: "vultr"                                                            │
-│ │    sub: "system:serviceaccount:default:test-sa"                            │
-│ └─ Mounts TOKEN #1 in pod at:                                                │
-│    /var/run/secrets/kubernetes.io/serviceaccount/token                       │
-│                                                                              │
-│ ┌────────────────────────────────────────────────────────────────────────┐   │
-│ │ Pod: my-app                                                            │   │
-│ │                                                                        │   │
-│ │ 1. Application starts                                                  │   │
-│ │ 2. SDK reads TOKEN #1 from file                                        │   │
-│ │ 3. SDK calls Vultr STS with TOKEN #1                                   │   │
-│ └────────────────────────────────────────────────────────────────────────┘   │
-└──────────────────────────────────────────────────────────────────────────────┘
-
-                             │
-TOKEN #1 (K8s JWT) sent to Vultr platform ────────────────────────────────────┘
-                             ↓
-
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ VULTR PLATFORM (api.vultr.com)                                               │
-│                                                                              │
-│ STS Service                                                                  │
-│ ├─ Receives TOKEN #1 from pod                                                │
-│ ├─ Validates TOKEN #1:                                                       │
-│ │  └─ Fetches public key from /v2/oidc/jwks                                  │
-│ │  └─ Verifies signature                                                     │
-│ │  └─ Checks issuer, audience, expiration                                    │
-│ │  └─ Checks role trust policy                                               │
-│ ├─ Generates TOKEN #2 (Temporary Credentials)                                │
-│ │  └─ AccessKeyId: VKAEXAMPLE123ABC                                          │
-│ │  └─ SecretAccessKey: secretKEY789XYZ                                       │
-│ │  └─ SessionToken: sessionTOKEN456DEF                                       │
-│ └─ Returns TOKEN #2 to pod                                                   │
-└──────────────────────────────────────────────────────────────────────────────┘
-
-                             │
-TOKEN #2 (Temporary credentials) sent back to pod ────────────────────────────┘
-                             ↓
-
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ YOUR CLUSTER                                                                 │
-│                                                                              │
-│ ┌────────────────────────────────────────────────────────────────────────┐   │
-│ │ Pod: my-app                                                            │   │
-│ │                                                                        │   │
-│ │ 4. SDK receives TOKEN #2 (credentials)                                 │   │
-│ │ 5. SDK caches TOKEN #2                                                 │   │
-│ │ 6. SDK uses TOKEN #2 for all API calls:                                │   │
-│ │    - List buckets                                                      │   │
-│ │    - Upload objects                                                    │   │
-│ │    - etc.                                                              │   │
-│ └────────────────────────────────────────────────────────────────────────┘   │
-└──────────────────────────────────────────────────────────────────────────────┘
-
-                             │
-All API calls use TOKEN #2 (credentials) ────────────────────────────────────┘
-                             ↓
-
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ VULTR PLATFORM APIs (api.vultr.com/v2/*)                                     │
-│                                                                              │
-│ Object Storage API, Compute API, etc.                                        │
-│ ├─ Receives request with TOKEN #2 (SessionToken)                             │
-│ ├─ Validates TOKEN #2 against session database                               │
-│ ├─ Checks permissions from role                                              │
-│ └─ Executes API operation                                                    │
-└──────────────────────────────────────────────────────────────────────────────┘
-
-```
+- From this point your cluster's ServiceAccount tokens are trusted by Vultr
+  IAM. Grant a role trust to the issuer (see
+  [Using the role from your application](#using-the-role-from-your-application)),
+  install the webhook or policy from this repo, and annotate a ServiceAccount
+  to start receiving injected pods.

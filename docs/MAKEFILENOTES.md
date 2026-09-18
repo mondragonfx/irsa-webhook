@@ -18,7 +18,10 @@ make docker-build
 # Build and push Docker image
 make docker-build docker-push
 
-# Generate TLS certificates
+# Deploy the MutatingAdmissionPolicy (k8s >= 1.36, no certificates needed)
+make deploy-policy
+
+# Generate TLS certificates (webhook mode)
 make certs
 
 # Deploy to Kubernetes

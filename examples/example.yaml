@@ -14,26 +14,32 @@ metadata:
 spec:
   serviceAccountName: example-app
   containers:
-  - name: aws-cli
-    image: amazon/aws-cli:latest
+  - name: app
+    image: curlimages/curl:latest
     command:
-      - /bin/bash
+      - /bin/sh
       - -c
       - |
         echo "Testing IRSA configuration..."
         echo ""
         echo "Environment variables:"
-        env | grep AWS
+        env | grep VULTR_
         echo ""
         echo "Token file contents:"
         ls -la /var/run/secrets/vultr.com/serviceaccount/
         echo ""
-        echo "Token (first 50 chars):"
-        head -c 50 /var/run/secrets/vultr.com/serviceaccount/token
+        echo "Exchanging the projected token for a Vultr API session..."
+        TOKEN=$(cat "$VULTR_WEB_IDENTITY_TOKEN_FILE")
+        curl -s -X POST https://api.vultr.com/v2/assumed-roles/assume \
+          -H "Authorization: Bearer $TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "{\"role_id\": \"$VULTR_ROLE_ID\", \"session_name\": \"example-app\", \"auth_method\": \"oidc\", \"duration\": 900}"
         echo ""
         echo ""
-        echo "Attempting to assume role..."
-        aws sts get-caller-identity || echo "Failed to get caller identity (expected if IAM role trust is not configured)"
+        echo "A 401 means this cluster's issuer isn't registered with Vultr yet;"
+        echo "a 403 means it's registered but this role has no trust for it."
+        echo "See 'Registering your cluster' in the README. A 201 with a"
+        echo "session_token means it worked."
         echo ""
         echo "Sleeping for 1 hour..."
         sleep 3600

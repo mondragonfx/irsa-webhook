@@ -1,4 +1,4 @@
-module github.com/example/irsa-webhook
+module github.com/vultr/irsa-webhook
 
 go 1.24.0
 

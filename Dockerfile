@@ -11,6 +11,7 @@ RUN go mod download
 
 # Copy source code
 COPY cmd/ cmd/
+COPY internal/ internal/
 
 # Build
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -o webhook ./cmd/

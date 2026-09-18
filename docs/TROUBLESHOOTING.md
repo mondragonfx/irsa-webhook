@@ -1,5 +1,16 @@
 # Troubleshooting Guide
 
+Most of this guide concerns the **webhook** mode. In the **MutatingAdmissionPolicy**
+mode there is no Deployment, Service, TLS or RBAC to debug; check the policy and
+binding instead:
+
+```bash
+kubectl get mutatingadmissionpolicy irsa.vultr.com -o yaml
+kubectl get mutatingadmissionpolicybinding irsa.vultr.com -o yaml
+# Type-check errors surface in .status.typeChecking; runtime errors are
+# returned on the pod create call because the policy fails closed.
+```
+
 ## Common Issues and Solutions
 
 ### 1. Webhook Not Responding
@@ -68,7 +79,7 @@ kubectl logs -n irsa-system -l app=irsa-webhook --tail=100
 1. **ServiceAccount annotation missing:**
    ```bash
    kubectl annotate sa <service-account-name> \
-     api.vultr.com/role: "775a6be6-45cd-4f19-94f5-6e4f96f093ec"
+     api.vultr.com/role="775a6be6-45cd-4f19-94f5-6e4f96f093ec"
    ```
 
 2. **Namespace excluded from webhook:**
@@ -109,7 +120,7 @@ kubectl get clusterrolebinding irsa-webhook -o yaml
 1. **Missing RBAC permissions:**
    ```bash
    # Reapply RBAC configuration
-   kubectl apply -f deploy.yaml
+   make deploy
    ```
 
 2. **ServiceAccount not bound to role:**
@@ -158,26 +169,29 @@ kubectl get mutatingwebhookconfiguration irsa-webhook \
      -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -text -noout
    ```
 
-### 5. AWS Credential Issues
+### 5. Credential Exchange Failures
 
 **Symptoms:**
-- Pods can't authenticate with AWS
-- "Unable to locate credentials" error
-- "InvalidIdentityToken" error from AWS STS
+- "Invalid API token" (401) when exchanging the projected token
+- "No trust relationship exists between this role and OIDC issuer" (403)
+- AWS SDKs report "Unable to locate credentials" or an STS error
 
 **Diagnosis:**
 ```bash
 # Check injected environment variables
-kubectl exec <pod-name> -- env | grep AWS
+kubectl exec <pod-name> -- env | grep VULTR_
 
 # Verify token file exists
 kubectl exec <pod-name> -- ls -la /var/run/secrets/vultr.com/serviceaccount/
 
-# Check token contents (first 50 chars)
-kubectl exec <pod-name> -- head -c 50 /var/run/secrets/vultr.com/serviceaccount/token
-
-# Test AWS STS
-kubectl exec <pod-name> -- aws sts get-caller-identity
+# Exchange the token directly (see "Using the role from your application"
+# in the README for the full command); the response tells you which of the
+# cases below applies
+kubectl exec <pod-name> -- sh -c \
+  'curl -s -X POST https://api.vultr.com/v2/assumed-roles/assume \
+     -H "Authorization: Bearer $(cat $VULTR_WEB_IDENTITY_TOKEN_FILE)" \
+     -H "Content-Type: application/json" \
+     -d "{\"role_id\": \"$VULTR_ROLE_ID\", \"session_name\": \"debug\", \"auth_method\": \"oidc\", \"duration\": 900}"'
 ```
 
 **Solutions:**
@@ -187,31 +201,34 @@ kubectl exec <pod-name> -- aws sts get-caller-identity
    - Check webhook logs for mutation
    - Delete and recreate the pod
 
-2. **IAM role trust policy issue:**
-   Ensure your IAM role has the correct trust policy:
-   ```json
-   {
-     "Version": "2012-10-17",
-     "Statement": [
-       {
-         "Effect": "Allow",
-         "Principal": {
-           "Federated": "arn:aws:iam::YOUR_ACCOUNT_ID:oidc-provider/YOUR_OIDC_PROVIDER"
-         },
-         "Action": "sts:AssumeRoleWithWebIdentity",
-         "Condition": {
-           "StringEquals": {
-             "YOUR_OIDC_PROVIDER:aud": "vultr"
-           }
-         }
-       }
-     ]
-   }
-   ```
+2. **401 "Invalid API token":** this cluster's OIDC issuer is not registered
+   with Vultr, or is registered under a different cluster ID. See
+   "Registering your cluster" in the README.
 
-3. **Wrong audience in token:**
+3. **403 "No trust relationship exists":** the issuer is registered, but the
+   role has no trust for it. Create one:
+   ```bash
+   curl -X POST https://api.vultr.com/v2/role-trusts \
+     -H "Authorization: Bearer ${VULTR_API_KEY}" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "role_id": "ROLE-ID",
+       "trust_type": "TemporaryAssumption",
+       "trusted_oidc_issuer_id": "ISSUER-ID"
+     }'
+   ```
+   Note that role trusts do not currently support a subject condition: a
+   trust to an issuer applies to every ServiceAccount in that cluster.
+
+4. **Wrong audience in token:**
    - Verify the projected token has audience "vultr"
-   - Check webhook configuration uses correct tokenAudience constant
+   - `kubectl exec <pod-name> -- cat /var/run/secrets/vultr.com/serviceaccount/token | cut -d. -f2 | base64 -d`
+
+5. **AWS SDK / STS-compatible endpoint:** the `AWS_ROLE_ARN` /
+   `AWS_ENDPOINT_URL_STS` variables are still injected for existing
+   consumers, but Vultr's STS-compatible endpoint does not currently issue
+   credentials for any role. New consumers should use the native exchange
+   above; this is a known server-side limitation, not a pod misconfiguration.
 
 ### 6. Performance Issues
 
@@ -247,7 +264,7 @@ kubectl describe pods -n irsa-system -l app=irsa-webhook
    ```
 
 3. **Increase resource limits:**
-   Edit deploy.yaml and increase CPU/memory limits:
+   Edit deploy/webhook.yaml and increase CPU/memory limits:
    ```yaml
    resources:
      requests:
@@ -267,9 +284,6 @@ kubectl describe pods -n irsa-system -l app=irsa-webhook
 
 **Diagnosis:**
 ```bash
-# Enable verbose logging (add to deployment)
-# Set LOG_LEVEL=debug in environment
-
 # Check specific pod that failed
 kubectl logs -n irsa-system -l app=irsa-webhook --tail=100 | grep -A 10 "Failed"
 ```
@@ -280,9 +294,9 @@ kubectl logs -n irsa-system -l app=irsa-webhook --tail=100 | grep -A 10 "Failed"
    - Ensure pod spec is valid JSON
    - Check for unusual container configurations
 
-2. **Update webhook logic:**
-   - Fix any bugs in generatePatches function
-   - Add error handling for edge cases
+2. **Report it:** patch generation is covered by unit tests in
+   `internal/mutate`, so a failure here usually means a pod shape those
+   tests don't cover yet. Open an issue with the pod spec that triggered it.
 
 ### 8. Multiple Webhooks Conflict
 
@@ -311,12 +325,12 @@ kubectl get mutatingwebhookconfigurations -o yaml | grep -A 5 "name:"
      -p='[{"op": "replace", "path": "/metadata/name", "value": "01-irsa-webhook"}]'
    ```
 
-2. **Add reinvocationPolicy:**
-   ```yaml
-   webhooks:
-   - name: irsa.vultr.com
-     reinvocationPolicy: IfNeeded  # or Never
-   ```
+2. **`reinvocationPolicy: IfNeeded` is already set** in `deploy/webhook.yaml`,
+   so the API server will call this webhook again if a later webhook (for
+   example a service-mesh sidecar injector) adds containers. Injection is
+   idempotent, so repeated calls do not duplicate the volume or env vars.
+   If you still see conflicts, check whether the other webhook is
+   overwriting fields this one set, not the reverse.
 
 ## Debug Commands Cheat Sheet
 
@@ -342,7 +356,7 @@ kubectl describe pods -n irsa-system -l app=irsa-webhook
 kubectl get events -n irsa-system --sort-by='.lastTimestamp'
 
 # Test ServiceAccount annotation
-kubectl get sa -A -o jsonpath='{range .items[?(@.metadata.annotations.vultr\.com/role-arn)]}{.metadata.namespace}{" "}{.metadata.name}{" "}{.metadata.annotations.vultr\.com/role-arn}{"\n"}{end}'
+kubectl get sa -A -o jsonpath='{range .items[?(@.metadata.annotations.api\.vultr\.com/role)]}{.metadata.namespace}{" "}{.metadata.name}{" "}{.metadata.annotations.api\.vultr\.com/role}{"\n"}{end}'
 
 # Validate webhook configuration
 kubectl get mutatingwebhookconfiguration irsa-webhook -o yaml | grep -E "(caBundle|service|path|port)"
@@ -381,9 +395,9 @@ If you're still experiencing issues:
 **Best Practices to Avoid Issues:**
 
 1. Always test in a non-production cluster first
-2. Set `failurePolicy: Ignore` during initial deployment
+2. Prefer the MutatingAdmissionPolicy mode on Kubernetes 1.36+; it has no certificates or availability concerns
 3. Monitor webhook performance and logs
-4. Keep certificates up to date (rotate every 365 days)
+4. Webhook mode: rerun `generate-certs.sh` before the certificate expires (10 years by default)
 5. Use resource limits to prevent webhook from consuming too much
 6. Implement readiness and liveness probes
 7. Scale webhook deployment for high-traffic clusters

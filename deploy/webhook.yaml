@@ -61,6 +61,15 @@ spec:
         app: irsa-webhook
     spec:
       serviceAccountName: irsa-webhook
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app: irsa-webhook
       containers:
       - name: webhook
         image: vultr/irsa-webhook:v0.3.0
@@ -71,6 +80,9 @@ spec:
         env:
         - name: STS_ENDPOINT
           value: "https://api.vultr.com/v2/assumed-roles/compatibility/aws/sts"
+        # Lifetime of the projected token injected into pods (seconds).
+        - name: TOKEN_EXPIRATION_SECONDS
+          value: "86400"
         - name: TLS_CERT_PATH
           value: /etc/webhook/certs/tls.crt
         - name: TLS_KEY_PATH
@@ -113,6 +125,17 @@ spec:
         secret:
           secretName: irsa-webhook-certs
 ---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: irsa-webhook
+  namespace: irsa-system
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: irsa-webhook
+---
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingWebhookConfiguration
 metadata:
@@ -132,10 +155,21 @@ webhooks:
     resources: ["pods"]
   admissionReviewVersions: ["v1"]
   sideEffects: None
-  timeoutSeconds: 10
-  failurePolicy: Ignore # Change to Fail for production if needed
+  timeoutSeconds: 5
+  # Fail closed: a pod that asked for credentials must not silently start
+  # without them. The namespaceSelector below keeps the blast radius away from
+  # system namespaces and from the webhook itself, so a broken webhook can
+  # always be repaired.
+  failurePolicy: Fail
+  # Mutation is idempotent, so let the API server call us again after another
+  # webhook adds containers (for example a Vault or service-mesh sidecar).
+  reinvocationPolicy: IfNeeded
   namespaceSelector:
     matchExpressions:
+    - key: kubernetes.io/metadata.name
+      operator: NotIn
+      values: ["kube-system", "kube-node-lease", "kube-public", "irsa-system"]
+    # Label a namespace irsa-webhook=disabled to opt it out entirely.
     - key: irsa-webhook
       operator: NotIn
       values: ["disabled"]

@@ -1,0 +1,134 @@
+# IRSA for Vultr as a MutatingAdmissionPolicy.
+#
+# This is the preferred way to run IRSA on Kubernetes 1.36 and newer. It does
+# the same injection as the webhook, but inside the API server: there is no
+# Deployment, no Service, no TLS certificate, no caBundle, and nothing to
+# rotate. Apply this file and annotate ServiceAccounts with api.vultr.com/role.
+#
+# Requirements (verified on kind with v1.35.8, v1.36.1 and v1.37.0):
+#   - Kubernetes >= 1.36 (MutatingAdmissionPolicy is GA and on by default), or
+#   - Kubernetes 1.34 / 1.35 with the kube-apiserver flags
+#       --feature-gates=MutatingAdmissionPolicy=true
+#       --runtime-config=admissionregistration.k8s.io/v1beta1=true
+#     and apiVersion changed to admissionregistration.k8s.io/v1beta1 below.
+#
+# How it works:
+#   The pod's ServiceAccount is the policy's parameter resource. The binding
+#   selects every ServiceAccount in the pod's namespace; the policy evaluates
+#   once per ServiceAccount and only the one whose name matches the pod's
+#   serviceAccountName (or "default") and carries the annotation produces a
+#   mutation. Everything else evaluates to a no-op.
+#
+#   The projected volume is added with a JSONPatch because apply
+#   configurations may not write atomic lists (projected.sources is one).
+#   Containers and initContainers use an apply configuration, which merges by
+#   name and is therefore idempotent under reinvocation. Keep JSONPatch usage
+#   to that one volume: a JSONPatch whose value is a container object crashed
+#   the API server request handler on 1.36 (reflect.Set panic in cel-go list
+#   conversion).
+#
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: irsa.vultr.com
+spec:
+  failurePolicy: Fail
+  reinvocationPolicy: IfNeeded
+  paramKind:
+    apiVersion: v1
+    kind: ServiceAccount
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      operations: ["CREATE"]
+      resources: ["pods"]
+    namespaceSelector:
+      matchExpressions:
+      - key: kubernetes.io/metadata.name
+        operator: NotIn
+        values: ["kube-system", "kube-node-lease", "kube-public"]
+      # Label a namespace irsa-webhook=disabled to opt it out entirely.
+      - key: irsa-webhook
+        operator: NotIn
+        values: ["disabled"]
+  variables:
+  - name: saName
+    expression: "has(object.spec.serviceAccountName) && object.spec.serviceAccountName != '' ? object.spec.serviceAccountName : 'default'"
+  - name: role
+    expression: "has(params.metadata.annotations) && 'api.vultr.com/role' in params.metadata.annotations ? params.metadata.annotations['api.vultr.com/role'] : ''"
+  - name: hasVolume
+    expression: "has(object.spec.volumes) && object.spec.volumes.exists(v, v.name == 'vultr-irsa-token')"
+  - name: applies
+    expression: "params.metadata.name == variables.saName && variables.role != ''"
+  mutations:
+  # Projected token volume. This is the only JSONPatch (see header).
+  - patchType: JSONPatch
+    jsonPatch:
+      expression: |
+        !variables.applies || variables.hasVolume ? [] :
+        [JSONPatch{
+          op: "add",
+          path: has(object.spec.volumes) ? "/spec/volumes/-" : "/spec/volumes",
+          value: has(object.spec.volumes) ? dyn(Object.spec.volumes{
+            name: "vultr-irsa-token",
+            projected: Object.spec.volumes.projected{
+              sources: [Object.spec.volumes.projected.sources{
+                serviceAccountToken: Object.spec.volumes.projected.sources.serviceAccountToken{
+                  audience: "vultr", expirationSeconds: 86400, path: "token"
+                }
+              }]
+            }
+          }) : dyn([Object.spec.volumes{
+            name: "vultr-irsa-token",
+            projected: Object.spec.volumes.projected{
+              sources: [Object.spec.volumes.projected.sources{
+                serviceAccountToken: Object.spec.volumes.projected.sources.serviceAccountToken{
+                  audience: "vultr", expirationSeconds: 86400, path: "token"
+                }
+              }]
+            }
+          }])
+        }]
+  - patchType: ApplyConfiguration
+    applyConfiguration:
+      expression: |
+        !variables.applies ? Object{} :
+        Object{
+          spec: Object.spec{
+            containers: object.spec.containers.map(c, Object.spec.containers{
+              name: c.name,
+              env: [
+                Object.spec.containers.env{name: "VULTR_ROLE_ID", value: variables.role},
+                Object.spec.containers.env{name: "VULTR_WEB_IDENTITY_TOKEN_FILE", value: "/var/run/secrets/vultr.com/serviceaccount/token"},
+                Object.spec.containers.env{name: "AWS_ROLE_ARN", value: variables.role},
+                Object.spec.containers.env{name: "AWS_WEB_IDENTITY_TOKEN_FILE", value: "/var/run/secrets/vultr.com/serviceaccount/token"},
+                Object.spec.containers.env{name: "AWS_STS_REGIONAL_ENDPOINTS", value: "regional"},
+                Object.spec.containers.env{name: "AWS_ENDPOINT_URL_STS", value: "https://api.vultr.com/v2/assumed-roles/compatibility/aws/sts"}
+              ],
+              volumeMounts: [Object.spec.containers.volumeMounts{name: "vultr-irsa-token", mountPath: "/var/run/secrets/vultr.com/serviceaccount", readOnly: true}]
+            }),
+            initContainers: has(object.spec.initContainers) ? object.spec.initContainers.map(c, Object.spec.initContainers{
+              name: c.name,
+              env: [
+                Object.spec.initContainers.env{name: "VULTR_ROLE_ID", value: variables.role},
+                Object.spec.initContainers.env{name: "VULTR_WEB_IDENTITY_TOKEN_FILE", value: "/var/run/secrets/vultr.com/serviceaccount/token"},
+                Object.spec.initContainers.env{name: "AWS_ROLE_ARN", value: variables.role},
+                Object.spec.initContainers.env{name: "AWS_WEB_IDENTITY_TOKEN_FILE", value: "/var/run/secrets/vultr.com/serviceaccount/token"},
+                Object.spec.initContainers.env{name: "AWS_STS_REGIONAL_ENDPOINTS", value: "regional"},
+                Object.spec.initContainers.env{name: "AWS_ENDPOINT_URL_STS", value: "https://api.vultr.com/v2/assumed-roles/compatibility/aws/sts"}
+              ],
+              volumeMounts: [Object.spec.initContainers.volumeMounts{name: "vultr-irsa-token", mountPath: "/var/run/secrets/vultr.com/serviceaccount", readOnly: true}]
+            }) : []
+          }
+        }
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicyBinding
+metadata:
+  name: irsa.vultr.com
+spec:
+  policyName: irsa.vultr.com
+  paramRef:
+    selector: {}
+    parameterNotFoundAction: Allow
