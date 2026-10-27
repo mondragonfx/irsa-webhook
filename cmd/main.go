@@ -1,10 +1,5 @@
-// Command irsa-webhook is a mutating admission webhook that injects Vultr IAM
-// role credentials into Pods whose ServiceAccount carries the
-// api.vultr.com/role annotation.
-//
-// On Kubernetes 1.36 and newer, prefer deploy/mutating-admission-policy.yaml,
-// which performs the same injection inside the API server with no webhook,
-// TLS, or Deployment at all. This binary exists for older clusters.
+// Command irsa-webhook injects Vultr IAM role credentials into Pods whose
+// ServiceAccount has the api.vultr.com/role annotation.
 package main
 
 import (

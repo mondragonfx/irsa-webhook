@@ -1,15 +1,5 @@
-// Package mutate builds the JSON patches that give a Pod access to a Vultr
-// IAM role through a projected ServiceAccount token.
-//
-// Pods receive the projected token plus VULTR_ROLE_ID and
-// VULTR_WEB_IDENTITY_TOKEN_FILE, which applications exchange at the native
-// assume-role endpoint. The AWS_* variables are kept for consumers written
-// against the STS-compatible endpoint.
-//
-// The output is deliberately idempotent: running the patches through the
-// generator a second time (or against a Pod another webhook already injected
-// into) produces no additional operations. That property is what makes it
-// safe to register the webhook with reinvocationPolicy: IfNeeded.
+// Package mutate builds the JSON patches that give a Pod a Vultr IAM role
+// through a projected ServiceAccount token. Patches are idempotent.
 package mutate
 
 import (
@@ -151,8 +141,7 @@ func (m *Mutator) containerPatches(basePath string, index int, c *corev1.Contain
 		}
 	}
 
-	// Variables the operator (or an earlier invocation) already set are
-	// left untouched; only the missing ones are added.
+	// Only add variables that are not already set.
 	missing := make([]corev1.EnvVar, 0, 6)
 	for _, e := range m.envVars(role) {
 		if !hasEnv(c.Env, e.Name) {

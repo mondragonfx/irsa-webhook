@@ -1,32 +1,6 @@
-# IRSA for Vultr as a MutatingAdmissionPolicy.
-#
-# This is the preferred way to run IRSA on Kubernetes 1.36 and newer. It does
-# the same injection as the webhook, but inside the API server: there is no
-# Deployment, no Service, no TLS certificate, no caBundle, and nothing to
-# rotate. Apply this file and annotate ServiceAccounts with api.vultr.com/role.
-#
-# Requirements (verified on kind with v1.35.8, v1.36.1 and v1.37.0):
-#   - Kubernetes >= 1.36 (MutatingAdmissionPolicy is GA and on by default), or
-#   - Kubernetes 1.34 / 1.35 with the kube-apiserver flags
-#       --feature-gates=MutatingAdmissionPolicy=true
-#       --runtime-config=admissionregistration.k8s.io/v1beta1=true
-#     and apiVersion changed to admissionregistration.k8s.io/v1beta1 below.
-#
-# How it works:
-#   The pod's ServiceAccount is the policy's parameter resource. The binding
-#   selects every ServiceAccount in the pod's namespace; the policy evaluates
-#   once per ServiceAccount and only the one whose name matches the pod's
-#   serviceAccountName (or "default") and carries the annotation produces a
-#   mutation. Everything else evaluates to a no-op.
-#
-#   The projected volume is added with a JSONPatch because apply
-#   configurations may not write atomic lists (projected.sources is one).
-#   Containers and initContainers use an apply configuration, which merges by
-#   name and is therefore idempotent under reinvocation. Keep JSONPatch usage
-#   to that one volume: a JSONPatch whose value is a container object crashed
-#   the API server request handler on 1.36 (reflect.Set panic in cel-go list
-#   conversion).
-#
+# IRSA as a MutatingAdmissionPolicy: no webhook, no certificates.
+# Kubernetes 1.36+. On 1.34/1.35 set --feature-gates=MutatingAdmissionPolicy=true
+# and --runtime-config=admissionregistration.k8s.io/v1beta1=true, and use v1beta1.
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingAdmissionPolicy
 metadata:
@@ -62,7 +36,7 @@ spec:
   - name: applies
     expression: "params.metadata.name == variables.saName && variables.role != ''"
   mutations:
-  # Projected token volume. This is the only JSONPatch (see header).
+  # JSONPatch only for the volume: a container object in JSONPatch crashes the 1.36 API server
   - patchType: JSONPatch
     jsonPatch:
       expression: |

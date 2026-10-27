@@ -17,8 +17,7 @@ import (
 	"github.com/vultr/irsa-webhook/internal/mutate"
 )
 
-// maxBodyBytes caps the AdmissionReview we are willing to read. Pods are
-// small; anything larger is not a request the API server would send.
+// maxBodyBytes caps the AdmissionReview size.
 const maxBodyBytes = 4 << 20
 
 // Server serves /mutate and /health.
@@ -104,9 +103,7 @@ func (s *Server) Mutate(ctx context.Context, request *admissionv1.AdmissionReque
 
 	sa, err := s.client.CoreV1().ServiceAccounts(request.Namespace).Get(ctx, saName, metav1.GetOptions{})
 	if err != nil {
-		// Without the ServiceAccount there is nothing to decide. Admit the Pod
-		// unchanged rather than blocking unrelated workloads on an API hiccup;
-		// the Pod would fail to start anyway if the ServiceAccount is missing.
+		// Admit unchanged rather than block on an API error.
 		log.Printf("ServiceAccount %s/%s lookup failed, admitting pod %q unchanged: %v",
 			request.Namespace, saName, podName(request, pod), err)
 		return allowed
@@ -142,8 +139,7 @@ func denied(msg string) *admissionv1.AdmissionResponse {
 	}
 }
 
-// podName prefers the request name, falling back to generateName for Pods
-// created by controllers, whose metadata.name is empty at admission time.
+// podName falls back to generateName for Pods created by controllers.
 func podName(request *admissionv1.AdmissionRequest, pod *corev1.Pod) string {
 	if pod.Name != "" {
 		return pod.Name

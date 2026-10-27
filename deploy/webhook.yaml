@@ -156,13 +156,9 @@ webhooks:
   admissionReviewVersions: ["v1"]
   sideEffects: None
   timeoutSeconds: 5
-  # Fail closed: a pod that asked for credentials must not silently start
-  # without them. The namespaceSelector below keeps the blast radius away from
-  # system namespaces and from the webhook itself, so a broken webhook can
-  # always be repaired.
+  # Fail closed; system namespaces and irsa-system are excluded below.
   failurePolicy: Fail
-  # Mutation is idempotent, so let the API server call us again after another
-  # webhook adds containers (for example a Vault or service-mesh sidecar).
+  # Mutation is idempotent.
   reinvocationPolicy: IfNeeded
   namespaceSelector:
     matchExpressions:
